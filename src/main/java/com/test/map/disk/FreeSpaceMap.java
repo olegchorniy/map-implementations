@@ -8,7 +8,7 @@ import static com.test.map.disk.Utils.assertState;
 
 public class FreeSpaceMap {
 
-    private static final int FSM_PAGE_SIZE = 2048;
+    private static final int FSM_PAGE_SIZE = 32;
     private static final byte FULL_BYTE = (byte) 0xFF;
 
     private final SeekableByteChannel fsmChannel;
@@ -46,7 +46,7 @@ public class FreeSpaceMap {
         writeFsmPage(fsmPageNum, fsmPage);
     }
 
-    /*private void take(int pageNum) throws IOException {
+    public boolean isFree(int pageNum) throws IOException {
         int fsmPages = fsmPages();
 
         int fsmPageNum = fsmPageNum(pageNum);
@@ -54,22 +54,46 @@ public class FreeSpaceMap {
         int fsmPageByte = fsmPageByte(fsmPageBitNum);
         int fsmByteBitNum = fsmByteBitNum(fsmPageBitNum);
 
-        assertState(fsmPageNum <= fsmPages, "Page num should point to an existing page or at least to the first extra page");
+        if (fsmPageNum >= fsmPages) {
+            // Pages bits for which don't even allocated are considered free
+            return true;
+        }
+
+        byte[] fsmPage = readFsmPage(fsmPageNum);
+
+        return (fsmPage[fsmPageByte] & (1 << fsmByteBitNum)) == 0;
+    }
+
+    public void take(int pageNum) throws IOException {
+        int fsmPages = fsmPages();
+
+        int fsmPageNum = fsmPageNum(pageNum);
+        int fsmPageBitNum = fsmPageBitNum(pageNum);
+        int fsmPageByte = fsmPageByte(fsmPageBitNum);
+        int fsmByteBitNum = fsmByteBitNum(fsmPageBitNum);
 
         int bitMask = 1 << fsmByteBitNum;
         byte[] fsmPage;
 
-        if (fsmPageNum == fsmPages) {
-            fsmPage = emptyFsmPage();
-        } else {
+        if (fsmPageNum < fsmPages) {
             fsmPage = readFsmPage(fsmPageNum);
+
+            // this assertion is needed only if page already exists in the file
+            assertState((fsmPage[fsmPageByte] & bitMask) == 0, "Requested page isn't free");
+        } else {
+            // we need to initialize explicitly all the intermediary pages
+            byte[] emptyPage = emptyFsmPage();
+
+            for (int newPageNum = fsmPages; newPageNum < fsmPageNum; newPageNum++) {
+                writeFsmPage(newPageNum, emptyPage);
+            }
+
+            fsmPage = emptyPage;
         }
 
-        assertState((fsmPage[fsmPageByte] & bitMask) != 0, "Requested page isn't free");
-
-        fsmPage[fsmPageByte] &= ~bitMask;
+        fsmPage[fsmPageByte] |= bitMask;
         writeFsmPage(fsmPageNum, fsmPage);
-    }*/
+    }
 
     public int takeFreePage() throws IOException {
         final int fsmPages = fsmPages();

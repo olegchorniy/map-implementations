@@ -12,10 +12,18 @@ import static com.test.map.disk.Utils.assertState;
 
 public class DiskHahMap {
 
-    private static final int PAGE_SIZE = 4096;
+    private static final int PAGE_SIZE = 256;
 
     private final SeekableByteChannel dataChannel;
-    private FreeSpaceMap fsm;
+
+    /**
+     * Meanings of the bits corresponding to bucket pages and to overflow pages are different:
+     * <ul>
+     * <li>1 for an overflow page means that it's taken and 0 means that it's free.</li>
+     * <li>1 for a bucket page means that it's header is already initialized and 0 means that it isn't</li>
+     * </ul>
+     */
+    private final FreeSpaceMap fsm;
 
     private Metadata metadata;
 
@@ -47,12 +55,17 @@ public class DiskHahMap {
         long fileSize = this.dataChannel.size();
 
         if (fileSize == 0) {
-            this.metadata = Metadata.empty();
+            setNewMetadata(Metadata.empty());
             return;
         }
 
         byte[] metadataBytes = Utils.read(this.dataChannel, 0, Metadata.SIZE);
         this.metadata = new Metadata(metadataBytes);
+    }
+
+    private void setNewMetadata(Metadata metadata) throws IOException {
+        this.metadata = metadata;
+        syncMetadata();
     }
 
     private void syncMetadata() throws IOException {
@@ -66,19 +79,23 @@ public class DiskHahMap {
         assertState(key.length <= Item.MAX_KEY_VALUE_SIZE, "Keys larger than page size are not supported for now");
 
         int hash = hash(key);
-        int pageNumber = bucketPageNumber(bucketIndex(hash));
+        int pageNum = bucketPageNumber(bucketIndex(hash));
 
-        Page page = readPage(pageNumber);
+        if (this.fsm.isFree(pageNum)) {
+            return null;
+        }
 
-        while (page != null) {
+        do {
+            Page page = readPage(pageNum);
+
             for (Item item : page.items) {
                 if (item.keyEqualsTo(key, hash)) {
                     return item.value;
                 }
             }
 
-            page = readPage(page.header.nextPageNumber);
-        }
+            pageNum = page.nextPageNumber;
+        } while (pageNum != Page.NO_PAGE);
 
         return null;
     }
@@ -89,48 +106,32 @@ public class DiskHahMap {
 
         int hash = hash(key);
         Item newItem = new Item(hash, key, value);
+        int itemSize = newItem.size();
 
-        assertState(newItem.size() <= Item.MAX_SIZE, "key-value pair is too large to fit into a single page");
-
-        // TODO: Concerns:
-        // TODO:  1) We need to initialize headers of all the created pages, not only the page we add the item to.
+        assertState(itemSize <= Item.MAX_SIZE, "key-value pair is too large to fit into a single page");
 
         int bucketIndex = bucketIndex(hash);
         int pageNumber = bucketPageNumber(bucketIndex);
 
-        /*if (pageNumber >= numPages()) {
-            // grow the file and init page headers
+        if (this.fsm.isFree(pageNumber)) {
+            // page is either exist in the file but isn't initialized or isn't even allocated
+            Page newPage = Page.empty();
+
+            newPage.items = array(newItem);
+            newPage.freeSpace -= itemSize;
+
+            // TODO: thing to think about: what is the correct order of write
+            // TODO: operations required to preserve storage integrity and consistency
+            this.fsm.take(pageNumber);
+            writePage(pageNumber, newPage);
+
+            return;
         }
 
-        Node<K, V>[] segment = getOrCreateSegment(segmentIndex);
-        Node<K, V> node = segment[bucketIndex];
+        //Page bucketPage = readPage(pageNumber);
+        throw new UnsupportedOperationException();
 
-        if (node == null) {
-            segment[bucketIndex] = new Node<>(key, hash, value);
-
-            this.size++;
-            split();
-
-            return null;
-        }
-
-        Node<K, V> prev;
-        do {
-            if (node.keyEqualsTo(key, hash)) {
-                V oldValue = node.value;
-                node.value = value;
-
-                return oldValue;
-            }
-
-            prev = node;
-            node = node.next;
-        } while (node != null);
-
-        prev.next = new Node<>(key, hash, value);
-
-        this.size++;
-        split();*/
+        //split();
     }
 
     public void remove(byte[] key) {
@@ -181,9 +182,7 @@ public class DiskHahMap {
     }
 
     private Page readPage(int pageNum) throws IOException {
-        if (pageNum == PageHeader.NO_PAGE || pageNum >= numPages()) {
-            return null;
-        }
+        assertState(pageNum >= 0 && pageNum < numPages(), "Can't read not existing page");
 
         byte[] pageBytes = Utils.read(this.dataChannel, pageOffset(pageNum), PAGE_SIZE);
         return new Page(pageBytes);
@@ -196,6 +195,13 @@ public class DiskHahMap {
 
     private static long pageOffset(int pageNum) {
         return Metadata.SIZE + pageNum * PAGE_SIZE;
+    }
+
+    /* -------------------- Array manipulation routines -------------------- */
+
+    @SafeVarargs
+    private static <T> T[] array(T... items) {
+        return items;
     }
 
     /* -------------- Data classes -------------- */
@@ -228,7 +234,7 @@ public class DiskHahMap {
             byte[] bytes = new byte[SIZE];
             ByteBuffer buffer = ByteBuffer.wrap(bytes);
 
-            buffer.put((byte) this.splitIndex);
+            buffer.put((byte) this.hashBits);
             buffer.putInt(this.splitIndex);
 
             for (int count : this.overflowPages) {
@@ -246,14 +252,27 @@ public class DiskHahMap {
     @AllArgsConstructor
     private static class Page {
 
-        PageHeader header;
+        static final int NO_PAGE = -1;
+        static final Item[] NO_ITEMS = new Item[0];
+
+        static final int HEADER_SIZE = 4 + 2 + 2 /* 2 additional bytes for items count in binary representation */;
+
+        // 2 bytes
+        int freeSpace;
+
+        // 4 bytes
+        int nextPageNumber;
+
         Item[] items;
 
         Page(byte[] bytes) {
             ByteBuffer buffer = ByteBuffer.wrap(bytes);
 
-            this.header = new PageHeader(buffer);
-            this.items = new Item[this.header.itemsCount];
+            int itemsCount = Short.toUnsignedInt(buffer.getShort());
+            this.freeSpace = Short.toUnsignedInt(buffer.getShort());
+            this.nextPageNumber = buffer.getInt();
+
+            this.items = new Item[itemsCount];
 
             for (int i = 0; i < this.items.length; i++) {
                 this.items[i] = new Item(buffer);
@@ -264,49 +283,26 @@ public class DiskHahMap {
             byte[] bytes = new byte[PAGE_SIZE];
             ByteBuffer buffer = ByteBuffer.wrap(bytes);
 
-            buffer.put(this.header.getBytes());
+            buffer.putShort((short) this.items.length);
+            buffer.putShort((short) this.freeSpace);
+            buffer.putInt(this.nextPageNumber);
+
             for (Item item : this.items) {
                 buffer.put(item.getBytes());
             }
 
             return bytes;
         }
-    }
 
-    @AllArgsConstructor
-    private static class PageHeader {
-
-        static final int NO_PAGE = -1;
-        static final int SIZE = 4 + 2 + 4;
-
-        // 4 bytes
-        int itemsCount;
-        // 2 bytes
-        int freeSpace;
-        // 4 bytes
-        int nextPageNumber;
-
-        PageHeader(ByteBuffer buffer) {
-            this.itemsCount = buffer.getInt();
-            this.freeSpace = Short.toUnsignedInt(buffer.getShort());
-            this.nextPageNumber = buffer.getInt();
-        }
-
-        byte[] getBytes() {
-            byte[] bytes = new byte[SIZE];
-            ByteBuffer buffer = ByteBuffer.wrap(bytes);
-
-            buffer.putInt(this.itemsCount);
-            buffer.putShort((short) this.freeSpace);
-            buffer.putInt(this.nextPageNumber);
-
-            return bytes;
+        static Page empty() {
+            // max free space amount is equal to the max size of a single item
+            return new Page(Item.MAX_SIZE, NO_PAGE, NO_ITEMS);
         }
     }
 
     @AllArgsConstructor
     private static class Item {
-        static final int MAX_SIZE = PAGE_SIZE - PageHeader.SIZE;
+        static final int MAX_SIZE = PAGE_SIZE - Page.HEADER_SIZE;
         static final int MAX_KEY_VALUE_SIZE = MAX_SIZE - 4 /* hash */ - 2 /* key.length */ - 2 /* value length */;
 
         // 4 bytes
