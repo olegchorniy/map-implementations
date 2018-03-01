@@ -7,19 +7,23 @@ import java.nio.file.Paths;
 
 public class DiskMapTesting {
 
-    @SneakyThrows
     public static void main(String[] args) {
+        mapTesting();
+    }
+
+    @SneakyThrows
+    public static void mapTesting() {
 
         InMemoryChannel data = new InMemoryChannel();
         InMemoryChannel fsm = new InMemoryChannel();
 
         DiskHahMap map = new DiskHahMap(data, fsm);
 
-        byte[] key1 = "key1".getBytes();
-        byte[] key2 = "key2".getBytes();
+        int num = 20;
 
-        map.put(key1, "value - 1".getBytes());
-        map.put(key2, "value - 2".getBytes());
+        for (int i = 0; i < num; i++) {
+            map.put("key - " + i, "value - " + i);
+        }
 
         System.out.println("FSM dump");
         Dumper.dumpToStdout(fsm.getArrayCopy());
@@ -29,8 +33,16 @@ public class DiskMapTesting {
         Dumper.dumpToStdout(data.getArrayCopy());
         System.out.println();
 
-        System.out.println(new String(map.get(key1)));
-        System.out.println(new String(map.get(key2)));
+        for (int i = 0; i < num - 1; i++) {
+            System.out.println(map.get("key - " + i));
+        }
+
+        System.out.println(map.get("key - " + (num - 1)));
+
+        map.put("key - 0", "value - ZZZZZZZ123"); // to force displacement of this item to the last page
+        System.out.println(map.get("key - 0"));
+
+        Dumper.dumpToStdout(data.getArrayCopy());
     }
 
     @SneakyThrows

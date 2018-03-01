@@ -3,6 +3,7 @@ package com.test.map.disk;
 import lombok.AllArgsConstructor;
 
 import java.io.IOException;
+import java.lang.reflect.Array;
 import java.nio.ByteBuffer;
 import java.nio.channels.SeekableByteChannel;
 import java.nio.file.Path;
@@ -72,6 +73,21 @@ public class DiskHahMap {
         Utils.write(this.dataChannel, 0, this.metadata.getBytes());
     }
 
+    /* -------------------- Testing API Methods -------------------- */
+
+    public String get(String key) throws IOException {
+        byte[] value = get(key.getBytes());
+        if (value == null) {
+            return null;
+        }
+
+        return new String(value);
+    }
+
+    public void put(String key, String value) throws IOException {
+        put(key.getBytes(), value.getBytes());
+    }
+
     /* -------------------- Main API Methods -------------------- */
 
     public byte[] get(byte[] key) throws IOException {
@@ -111,25 +127,119 @@ public class DiskHahMap {
         assertState(itemSize <= Item.MAX_SIZE, "key-value pair is too large to fit into a single page");
 
         int bucketIndex = bucketIndex(hash);
-        int pageNumber = bucketPageNumber(bucketIndex);
+        int pageNum = bucketPageNumber(bucketIndex);
 
-        if (this.fsm.isFree(pageNumber)) {
+        if (this.fsm.isFree(pageNum)) {
             // page is either exist in the file but isn't initialized or isn't even allocated
             Page newPage = Page.empty();
 
             newPage.items = array(newItem);
             newPage.freeSpace -= itemSize;
 
-            // TODO: thing to think about: what is the correct order of write
-            // TODO: operations required to preserve storage integrity and consistency
-            this.fsm.take(pageNumber);
-            writePage(pageNumber, newPage);
+            writePage(pageNum, newPage);
+            this.fsm.take(pageNum);
 
             return;
         }
 
-        //Page bucketPage = readPage(pageNumber);
-        throw new UnsupportedOperationException();
+        /*
+            Possible cases:
+            1)  Given key doesn't exist in the map. We need a page which has enough space to accommodate
+                new key-value pair. We can keep track of such pages during iteration through them.
+                If there was no such page we have to add a new one. We need to update FSM, map's overflowPages counter
+                and link it to the last page we have checked.
+
+            2)  Given key already exists in the map. Sub-cases:
+                2.1)  New value fit in the same page. Just replace the value, update freeSpace field
+                      and flush the page to the storage.
+                2.2)  It doesn't. We need to remove entire item from the page where it resides
+                      and put the key and the new value into another page (like in the first case).
+                      Such page couldn't become empty because in such case the new item must fit in it - contradiction.
+         */
+
+        // previous page for the case when we have to add a new page to the chain
+        int prevPageNum;
+        Page prevPage;
+
+        // page which has enough space to accommodate new item
+        int freePageNum = 0;
+        Page freePage = null;
+
+        // true indicates that we have found the key in the map but we haven't found a page which has enough free space.
+        // We need to keep looking for such page but don't need to check the page's items.
+        boolean freePageLookingMode = false;
+
+        do {
+            Page page = readPage(pageNum);
+
+            if (!freePageLookingMode) {
+                Item[] items = page.items;
+
+                for (int i = 0; i < items.length; i++) {
+                    Item item = items[i];
+
+                    if (item.keyEqualsTo(key, hash)) {
+                        // Free space in the page if we would have removed the old item and added the new one
+                        int newFreeSpace = page.freeSpace + item.size() - itemSize;
+                        if (newFreeSpace >= 0) {
+                            // Case 2.1
+                            page.freeSpace = newFreeSpace;
+                            items[i] = newItem;
+
+                            writePage(pageNum, page);
+                            return;
+                        } else {
+                            // Case 2.2
+
+                            page.freeSpace -= item.size();
+                            page.items = remove(items, i);
+
+                            writePage(pageNum, page);
+
+                            freePageLookingMode = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (freePage == null && itemSize <= page.freeSpace) {
+                freePage = page;
+                freePageNum = pageNum;
+            }
+
+            prevPage = page;
+            prevPageNum = pageNum;
+
+            pageNum = page.nextPageNumber;
+
+            // Stop iterations when we either reached the end of the chain or we found a free page in the free-page-looking mode.
+        } while (pageNum != Page.NO_PAGE && (!freePageLookingMode || freePage == null));
+
+        // Case 1 or 2.2 (in case of lack of free space in the original page)
+
+        if (freePage != null) {
+            freePage.freeSpace -= itemSize;
+            freePage.items = add(freePage.items, newItem);
+
+            writePage(freePageNum, freePage);
+
+            return;
+        }
+
+        int newPageNum = this.fsm.findFreePage();
+
+        Page newPage = Page.empty();
+        newPage.freeSpace -= itemSize;
+        newPage.items = array(newItem);
+
+        prevPage.nextPageNumber = newPageNum;
+
+        // And finally, IO ops
+        writePage(prevPageNum, prevPage);
+        writePage(newPageNum, newPage);
+
+        this.fsm.take(newPageNum);
 
         //split();
     }
@@ -202,6 +312,23 @@ public class DiskHahMap {
     @SafeVarargs
     private static <T> T[] array(T... items) {
         return items;
+    }
+
+    public static <T> T[] add(T[] array, T element) {
+        T[] newArray = Arrays.copyOf(array, array.length + 1);
+        newArray[array.length] = element;
+
+        return newArray;
+    }
+
+    @SuppressWarnings("unchecked")
+    public static <T> T[] remove(T[] array, int index) {
+        T[] newArray = (T[]) Array.newInstance(array.getClass().getComponentType(), array.length - 1);
+
+        System.arraycopy(array, 0, newArray, 0, index);
+        System.arraycopy(array, index + 1, newArray, index, array.length - index - 1);
+
+        return newArray;
     }
 
     /* -------------- Data classes -------------- */

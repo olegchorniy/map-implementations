@@ -96,6 +96,13 @@ public class FreeSpaceMap {
     }
 
     public int takeFreePage() throws IOException {
+        int freePageNum = findFreePage();
+        take(freePageNum);
+
+        return freePageNum;
+    }
+
+    private int _takeFreePage() throws IOException {
         final int fsmPages = fsmPages();
 
         for (int pageNum = 0; pageNum < fsmPages; pageNum++) {
@@ -121,6 +128,26 @@ public class FreeSpaceMap {
         // set the least significant bit to 1 (to indicate that page isn't free)
         newPage[0] = 1;
         writeFsmPage(fsmPages, newPage);
+
+        return composePageNumber(0, 0, fsmPages);
+    }
+
+    // The same as above but doesn't modify any bits and doesn't add any pages
+    public int findFreePage() throws IOException {
+        final int fsmPages = fsmPages();
+
+        for (int pageNum = 0; pageNum < fsmPages; pageNum++) {
+            byte[] page = readFsmPage(pageNum);
+
+            for (int byteNum = 0; byteNum < page.length; byteNum++) {
+                if (page[byteNum] == FULL_BYTE) {
+                    continue;
+                }
+
+                int bitNum = lowestZeroBit(page[byteNum]);
+                return composePageNumber(bitNum, byteNum, pageNum);
+            }
+        }
 
         return composePageNumber(0, 0, fsmPages);
     }
