@@ -94,12 +94,14 @@ public class DiskHahMap {
         assertState(key != null, "Null key are not allowed");
         assertState(key.length <= Item.MAX_KEY_VALUE_SIZE, "Keys larger than page size are not supported for now");
 
-        int hash = hash(key);
-        int pageNum = bucketPageNumber(bucketIndex(hash));
+        final int hash = hash(key);
+        final int bucketPageNum = bucketPageNumber(bucketIndex(hash));
 
-        if (this.fsm.isFree(pageNum)) {
+        if (bucketPageNum >= this.metadata.bucketsNum()) {
             return null;
         }
+
+        int pageNum = bucketPageNum;
 
         do {
             Page page = readPage(pageNum);
@@ -129,12 +131,9 @@ public class DiskHahMap {
         int bucketIndex = bucketIndex(hash);
         int pageNum = bucketPageNumber(bucketIndex);
 
-        if (this.fsm.isFree(pageNum)) {
-            // page is either exist in the file but isn't initialized or isn't even allocated
+        if (pageNum >= this.metadata.bucketsNum()) {
             Page newPage = Page.empty();
-
-            newPage.items = array(newItem);
-            newPage.freeSpace -= itemSize;
+            newPage.addItem(newItem);
 
             writePage(pageNum, newPage);
             this.fsm.take(pageNum);
@@ -171,34 +170,27 @@ public class DiskHahMap {
 
         do {
             Page page = readPage(pageNum);
+            Item[] items = page.items;
 
-            if (!freePageLookingMode) {
-                Item[] items = page.items;
+            for (int i = 0; i < items.length && !freePageLookingMode; i++) {
+                Item item = items[i];
 
-                for (int i = 0; i < items.length; i++) {
-                    Item item = items[i];
+                if (item.keyEqualsTo(key, hash)) {
+                    if (page.freeSpace + item.size() >= itemSize) {
+                        // Case 2.1
 
-                    if (item.keyEqualsTo(key, hash)) {
-                        // Free space in the page if we would have removed the old item and added the new one
-                        int newFreeSpace = page.freeSpace + item.size() - itemSize;
-                        if (newFreeSpace >= 0) {
-                            // Case 2.1
-                            page.freeSpace = newFreeSpace;
-                            items[i] = newItem;
+                        page.replace(i, newItem);
+                        writePage(pageNum, page);
 
-                            writePage(pageNum, page);
-                            return;
-                        } else {
-                            // Case 2.2
+                        return;
+                    } else {
+                        // Case 2.2
 
-                            page.freeSpace -= item.size();
-                            page.items = remove(items, i);
+                        page.removeItem(i);
+                        writePage(pageNum, page);
 
-                            writePage(pageNum, page);
-
-                            freePageLookingMode = true;
-                            break;
-                        }
+                        freePageLookingMode = true;
+                        break;
                     }
                 }
             }
@@ -219,9 +211,7 @@ public class DiskHahMap {
         // Case 1 or 2.2 (in case of lack of free space in the original page)
 
         if (freePage != null) {
-            freePage.freeSpace -= itemSize;
-            freePage.items = add(freePage.items, newItem);
-
+            freePage.addItem(newItem);
             writePage(freePageNum, freePage);
 
             return;
@@ -230,8 +220,7 @@ public class DiskHahMap {
         int newPageNum = this.fsm.findFreePage();
 
         Page newPage = Page.empty();
-        newPage.freeSpace -= itemSize;
-        newPage.items = array(newItem);
+        newPage.addItem(newItem);
 
         prevPage.nextPageNumber = newPageNum;
 
@@ -273,12 +262,30 @@ public class DiskHahMap {
         // highest bit of the bucketIndex shows how many values from the metadata.overflowPages we need to sum
         int highestBit = 31 - Integer.numberOfLeadingZeros(bucketIndex);
 
-        int overflowPagesNumber = 0;
+        int overflowPagesSoFar = 0;
         for (int i = highestBit; i >= 0; i--) {
-            overflowPagesNumber += metadata.overflowPages[i];
+            overflowPagesSoFar += metadata.overflowPages[i];
         }
 
-        return bucketIndex + overflowPagesNumber;
+        return bucketIndex + overflowPagesSoFar;
+    }
+
+    // TODO: finish this
+    private int fsmPageNumIntoOverflowPageNum(int fsmPageNum) {
+        int overflowPageNum = 0;
+        int[] overflowPages = this.metadata.overflowPages;
+
+        int overflowPagesSoFar = 0;
+        for (int i = 0; i < overflowPages.length; i++) {
+            overflowPagesSoFar += overflowPages[i];
+
+            if (fsmPageNum < overflowPagesSoFar) {
+
+            }
+        }
+
+        throw new UnsupportedOperationException();
+
     }
 
     private static int mask(int nBits) {
@@ -315,6 +322,10 @@ public class DiskHahMap {
     }
 
     public static <T> T[] add(T[] array, T element) {
+        if (array.length == 0) {
+            return array(element);
+        }
+
         T[] newArray = Arrays.copyOf(array, array.length + 1);
         newArray[array.length] = element;
 
@@ -371,6 +382,14 @@ public class DiskHahMap {
             return bytes;
         }
 
+        /*void incOverflowPagesAtCurrentSplit() {
+            this.overflowPages[this.hashBits - 1]++;
+        }*/
+
+        private int bucketsNum() {
+            return (1 << (this.hashBits - 1)) + this.splitIndex;
+        }
+
         static Metadata empty() {
             return new Metadata(1, 0, new int[32]);
         }
@@ -419,6 +438,21 @@ public class DiskHahMap {
             }
 
             return bytes;
+        }
+
+        void addItem(Item item) {
+            this.freeSpace -= item.size();
+            this.items = add(this.items, item);
+        }
+
+        void removeItem(int index) {
+            this.freeSpace += this.items[index].size();
+            this.items = remove(this.items, index);
+        }
+
+        void replace(int index, Item newItem) {
+            this.freeSpace = this.freeSpace + this.items[index].size() - newItem.size();
+            this.items[index] = newItem;
         }
 
         static Page empty() {
