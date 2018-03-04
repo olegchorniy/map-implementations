@@ -15,6 +15,7 @@ import static com.test.map.disk.Utils.assertState;
  * <ul>
  * <li>Sort items within each page by their keys</li>
  * <li>Compaction during page split</li>
+ * <li>Replace bucket page with the first overflow page if it becomes free upon item deletion</li>
  * </ul>
  * <p>
  * Things to think about:
@@ -104,8 +105,8 @@ public class DiskHahMap {
     /* -------------------- Main API Methods -------------------- */
 
     public byte[] get(byte[] key) throws IOException {
-        assertState(key != null, "Null key are not allowed");
-        assertState(key.length <= Item.MAX_KEY_VALUE_SIZE, "Keys larger than page size are not supported for now");
+        checkKeyNotNull(key);
+        checkKeySize(key);
 
         final int hash = hash(key);
         final int bucketPageNum = bucketPageNumber(bucketIndex(hash));
@@ -132,8 +133,8 @@ public class DiskHahMap {
     }
 
     public void put(byte[] key, byte[] value) throws IOException {
-        assertState(key != null, "Null keys are not allowed");
-        assertState(value != null, "Null values are not allowed");
+        checkKeyNotNull(key);
+        checkValueNotNull(value);
 
         int hash = hash(key);
         Item newItem = new Item(hash, key, value);
@@ -147,18 +148,18 @@ public class DiskHahMap {
         int pageNum = bucketPageNumber(bucketIndex);
 
         /*
-            Possible cases:
-            1)  Given key doesn't exist in the map. We need a page which has enough space to accommodate
-                new key-value pair. We can keep track of such pages during iteration through them.
-                If there was no such page we have to add a new one. We need to update FSM, map's overflowPages counter
-                and link it to the last page we have checked.
-
-            2)  Given key already exists in the map. Sub-cases:
-                2.1)  New value fit in the same page. Just replace the value, update freeSpace field
-                      and flush the page to the storage.
-                2.2)  It doesn't. We need to remove entire item from the page where it resides
-                      and put the key and the new value into another page (like in the first case).
-                      Such page couldn't become empty because in such case the new item must fit in it - contradiction.
+         *  Possible cases:
+         *  1)  Given key doesn't exist in the map. We need a page which has enough space to accommodate
+         *      new key-value pair. We can keep track of such pages during iteration through them.
+         *      If there was no such page we have to add a new one. We need to update FSM, map's overflowPages counter
+         *      and link it to the last page we have checked.
+         *
+         *  2)  Given key already exists in the map. Sub-cases:
+         *      2.1)  New value fit in the same page. Just replace the value, update freeSpace field
+         *            and flush the page to the storage.
+         *      2.2)  It doesn't. We need to remove entire item from the page where it resides
+         *            and put the key and the new value into another page (like in the first case).
+         *            Such page couldn't become empty because in such case the new item must fit in it - contradiction.
          */
 
         // previous page for the case when we have to add a new page to the chain
@@ -247,8 +248,65 @@ public class DiskHahMap {
         //split();
     }
 
-    public void remove(byte[] key) {
-        throw new UnsupportedOperationException();
+    public void remove(byte[] key) throws IOException {
+        checkKeyNotNull(key);
+        checkKeySize(key);
+
+        final int hash = hash(key);
+        final int bucketPageNum = bucketPageNumber(bucketIndex(hash));
+
+        if (bucketPageNum >= this.metadata.bucketsNum()) {
+            return;
+        }
+
+        Page prevPage = null;
+        int prevPageNum = -1;
+        int pageNum = bucketPageNum;
+
+        do {
+            Page page = readPage(pageNum);
+
+            for (int i = 0; i < page.items.length; i++) {
+                Item item = page.items[i];
+
+                if (item.keyEqualsTo(key, hash)) {
+                    page.removeItem(i);
+
+                    // Page isn't empty or it's a bucket page: just write it back to the channel.
+                    if (page.items.length != 0 || prevPage == null) {
+                        writePage(pageNum, page);
+                        return;
+                    }
+
+                    // It's an overflow page. Update pointers and return this page to the FSM.
+                    // We DON'T need to update the page's content in the channel, so we can save one disk IO op.
+                    prevPage.nextPageNumber = page.nextPageNumber;
+
+                    this.fsm.free(overflowPageNumToFsmPageNum(pageNum));
+                    writePage(prevPageNum, prevPage);
+
+                    return;
+                }
+            }
+
+            prevPage = page;
+            prevPageNum = pageNum;
+            pageNum = page.nextPageNumber;
+        } while (pageNum != Page.NO_PAGE);
+    }
+
+    /* -------------------- Precondition checks -------------------- */
+
+    private static void checkKeyNotNull(byte[] key) {
+        assertState(key != null, "Null keys are not allowed");
+    }
+
+    private static void checkValueNotNull(byte[] key) {
+        assertState(key != null, "Null values are not allowed");
+    }
+
+    private static void checkKeySize(byte[] key) {
+        assertState(key.length <= Item.MAX_KEY_VALUE_SIZE, "Keys larger than page size are not supported for now");
     }
 
     /* -------------------- Calculations -------------------- */
@@ -296,7 +354,25 @@ public class DiskHahMap {
             }
         }
 
-        throw new IllegalStateException("There is no overflow page with number=" + fsmPageNum);
+        throw new IllegalStateException("There is no overflow page with fsm number: " + fsmPageNum);
+    }
+
+    // TODO: double-check this code!!!
+    private int overflowPageNumToFsmPageNum(int overflowPageNum) {
+        final int splitPoint = this.metadata.activeSplitPoint();
+        final int[] overflowPages = this.metadata.overflowPages;
+
+        for (int i = 0, pageCount = 0, buckets = 1; i <= splitPoint; i++, buckets <<= 1) {
+            pageCount += overflowPages[i];
+
+            int totalPageCount = pageCount + buckets;
+
+            if (overflowPageNum < totalPageCount) {
+                return overflowPageNum - buckets;
+            }
+        }
+
+        throw new IllegalStateException("There is no overflow page with number: " + overflowPageNum);
     }
 
     private static int mask(int nBits) {
