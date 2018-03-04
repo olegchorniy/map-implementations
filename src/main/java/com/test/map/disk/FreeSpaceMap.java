@@ -18,8 +18,21 @@ public class FreeSpaceMap {
     }
 
     public FreeSpaceMap(SeekableByteChannel channel) throws IOException {
+        this(channel, false);
+    }
+
+    public FreeSpaceMap(SeekableByteChannel channel, boolean newFsm) throws IOException {
         this.fsmChannel = channel;
-        checkFileSize();
+
+        if (newFsm) {
+            assertEmpty();
+        } else {
+            checkFileSize();
+        }
+    }
+
+    private void assertEmpty() throws IOException {
+        assertState(fsmFileSize() == 0, "File is not empty");
     }
 
     private void checkFileSize() throws IOException {

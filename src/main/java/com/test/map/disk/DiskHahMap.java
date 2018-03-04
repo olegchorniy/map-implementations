@@ -6,70 +6,83 @@ import java.io.IOException;
 import java.lang.reflect.Array;
 import java.nio.ByteBuffer;
 import java.nio.channels.SeekableByteChannel;
-import java.nio.file.Path;
 import java.util.Arrays;
 
 import static com.test.map.disk.Utils.assertState;
 
+/**
+ * Optimizations:
+ * <ul>
+ * <li>Sort items within each page by their keys</li>
+ * <li>Compaction during page split</li>
+ * </ul>
+ * <p>
+ * Things to think about:
+ * <ul>
+ * <li>Definition of {@code load factor}</li>
+ * </ul>
+ */
 public class DiskHahMap {
 
+    private static final int HASH_LENGTH = 32;
     private static final int PAGE_SIZE = 256;
 
     private final SeekableByteChannel dataChannel;
-
-    /**
-     * Meanings of the bits corresponding to bucket pages and to overflow pages are different:
-     * <ul>
-     * <li>1 for an overflow page means that it's taken and 0 means that it's free.</li>
-     * <li>1 for a bucket page means that it's header is already initialized and 0 means that it isn't</li>
-     * </ul>
-     */
     private final FreeSpaceMap fsm;
 
     private Metadata metadata;
 
-    public DiskHahMap(Path filesDirectory, String mapName) throws IOException {
-        this(
-                Utils.openRWChannel(filesDirectory.resolve(mapName + "_data")),
-                Utils.openRWChannel(filesDirectory.resolve(mapName + "_fsm"))
-        );
+    public DiskHahMap(SeekableByteChannel dataChannel, SeekableByteChannel fsmChannel, int initialSize) throws IOException {
+        this.dataChannel = dataChannel;
+        this.fsm = new FreeSpaceMap(fsmChannel, true);
+
+        this.metadata = Metadata.forInitial(initialSize);
+
+        assertEmpty();
+
+        initBuckets();
+        writeMetadata();
     }
 
     public DiskHahMap(SeekableByteChannel dataChannel, SeekableByteChannel fsmChannel) throws IOException {
         this.dataChannel = dataChannel;
         this.fsm = new FreeSpaceMap(fsmChannel);
 
-        checkFileSize();
-        initMetadata();
+        checkFileSizeAndInit();
     }
 
-    private void checkFileSize() throws IOException {
-        long fileSize = this.dataChannel.size();
+    private void assertEmpty() throws IOException {
+        assertState(this.dataChannel.size() == 0, "Data channel is not empty");
+    }
 
-        // File should either be empty or consist of metadata page + whole number of pages
-        assertState(fileSize == 0 || (fileSize - Metadata.SIZE) % PAGE_SIZE == 0, "File has invalid size: " + fileSize);
+    private void checkFileSizeAndInit() throws IOException {
+        // File should contain at least metadata and all the pages determined by the metadata's fields
+
+        long dataSize = this.dataChannel.size();
+        assertState(dataSize >= Metadata.SIZE, "Data channel size is less than metadata size: " + dataSize);
+
+        readMetadata();
+
+        long exactExpectedSize = Metadata.SIZE + this.metadata.expectedNumberOfPages() * PAGE_SIZE;
+        assertState(exactExpectedSize == dataSize, "Invalid data channel size: " + dataSize);
+    }
+
+    private void initBuckets() throws IOException {
+        Page emptyPage = Page.empty();
+
+        for (int i = 0; i < this.metadata.bucketsNum(); i++) {
+            writePage(i, emptyPage);
+        }
     }
 
     /* -------------------- Metadata management methods -------------------- */
 
-    private void initMetadata() throws IOException {
-        long fileSize = this.dataChannel.size();
-
-        if (fileSize == 0) {
-            setNewMetadata(Metadata.empty());
-            return;
-        }
-
+    private void readMetadata() throws IOException {
         byte[] metadataBytes = Utils.read(this.dataChannel, 0, Metadata.SIZE);
         this.metadata = new Metadata(metadataBytes);
     }
 
-    private void setNewMetadata(Metadata metadata) throws IOException {
-        this.metadata = metadata;
-        syncMetadata();
-    }
-
-    private void syncMetadata() throws IOException {
+    private void writeMetadata() throws IOException {
         Utils.write(this.dataChannel, 0, this.metadata.getBytes());
     }
 
@@ -128,18 +141,10 @@ public class DiskHahMap {
 
         assertState(itemSize <= Item.MAX_SIZE, "key-value pair is too large to fit into a single page");
 
+        Metadata metadata = this.metadata;
+
         int bucketIndex = bucketIndex(hash);
         int pageNum = bucketPageNumber(bucketIndex);
-
-        if (pageNum >= this.metadata.bucketsNum()) {
-            Page newPage = Page.empty();
-            newPage.addItem(newItem);
-
-            writePage(pageNum, newPage);
-            this.fsm.take(pageNum);
-
-            return;
-        }
 
         /*
             Possible cases:
@@ -217,18 +222,27 @@ public class DiskHahMap {
             return;
         }
 
-        int newPageNum = this.fsm.findFreePage();
+        // Update map's metadata increasing overflow pages counter
+        // Important: this line should be executed before fsmPageNumToOverflowPageNum invocation.
+        metadata.incOverflowPages();
 
+        int newFsmPageNum = this.fsm.findFreePage();
+        int newPageNum = fsmPageNumToOverflowPageNum(newFsmPageNum);
+
+        // Create a new page and add a new item into it
         Page newPage = Page.empty();
         newPage.addItem(newItem);
 
+        // Establish a link between the last page in the chain and the new one
         prevPage.nextPageNumber = newPageNum;
 
         // And finally, IO ops
         writePage(prevPageNum, prevPage);
         writePage(newPageNum, newPage);
 
-        this.fsm.take(newPageNum);
+        writeMetadata();
+
+        this.fsm.take(newFsmPageNum);
 
         //split();
     }
@@ -270,22 +284,19 @@ public class DiskHahMap {
         return bucketIndex + overflowPagesSoFar;
     }
 
-    // TODO: finish this
-    private int fsmPageNumIntoOverflowPageNum(int fsmPageNum) {
-        int overflowPageNum = 0;
-        int[] overflowPages = this.metadata.overflowPages;
+    private int fsmPageNumToOverflowPageNum(int fsmPageNum) {
+        final int splitPoint = this.metadata.activeSplitPoint();
+        final int[] overflowPages = this.metadata.overflowPages;
 
-        int overflowPagesSoFar = 0;
-        for (int i = 0; i < overflowPages.length; i++) {
-            overflowPagesSoFar += overflowPages[i];
+        for (int i = 0, pagesCount = 0; i <= splitPoint; i++) {
+            pagesCount += overflowPages[i];
 
-            if (fsmPageNum < overflowPagesSoFar) {
-
+            if (fsmPageNum < pagesCount) {
+                return fsmPageNum + (1 << i);
             }
         }
 
-        throw new UnsupportedOperationException();
-
+        throw new IllegalStateException("There is no overflow page with number=" + fsmPageNum);
     }
 
     private static int mask(int nBits) {
@@ -306,7 +317,6 @@ public class DiskHahMap {
     }
 
     private void writePage(int pageNumber, Page page) throws IOException {
-        // TODO: there should be no gaps in the file, so does it make sense to check the pageNumber here?
         Utils.write(this.dataChannel, pageOffset(pageNumber), page.getBytes());
     }
 
@@ -316,16 +326,7 @@ public class DiskHahMap {
 
     /* -------------------- Array manipulation routines -------------------- */
 
-    @SafeVarargs
-    private static <T> T[] array(T... items) {
-        return items;
-    }
-
-    public static <T> T[] add(T[] array, T element) {
-        if (array.length == 0) {
-            return array(element);
-        }
-
+    private static <T> T[] add(T[] array, T element) {
         T[] newArray = Arrays.copyOf(array, array.length + 1);
         newArray[array.length] = element;
 
@@ -333,7 +334,7 @@ public class DiskHahMap {
     }
 
     @SuppressWarnings("unchecked")
-    public static <T> T[] remove(T[] array, int index) {
+    private static <T> T[] remove(T[] array, int index) {
         T[] newArray = (T[]) Array.newInstance(array.getClass().getComponentType(), array.length - 1);
 
         System.arraycopy(array, 0, newArray, 0, index);
@@ -347,13 +348,14 @@ public class DiskHahMap {
     @AllArgsConstructor
     private static class Metadata {
 
-        static final int SIZE = 1 + 4 + 32 * 4;
+        static final int ARRAY_LENGTH = HASH_LENGTH + 1;
+        static final int SIZE = 1 + 4 + ARRAY_LENGTH * 4;
 
         // 1 byte
         int hashBits;
         // 4 bytes
         int splitIndex;
-        // 32 * 4
+        // ARRAY_LENGTH * 4
         int[] overflowPages;
 
         Metadata(byte[] bytes) {
@@ -361,7 +363,7 @@ public class DiskHahMap {
 
             this.hashBits = Byte.toUnsignedInt(buffer.get());
             this.splitIndex = buffer.getInt();
-            this.overflowPages = new int[32];
+            this.overflowPages = new int[ARRAY_LENGTH];
 
             for (int i = 0; i < this.overflowPages.length; i++) {
                 this.overflowPages[i] = buffer.getInt();
@@ -382,16 +384,45 @@ public class DiskHahMap {
             return bytes;
         }
 
-        /*void incOverflowPagesAtCurrentSplit() {
-            this.overflowPages[this.hashBits - 1]++;
-        }*/
+        void incOverflowPages() {
+            this.overflowPages[activeSplitPoint()]++;
+        }
 
-        private int bucketsNum() {
+        int activeSplitPoint() {
+            // If no splits were performed so far we consider current
+            // split point as active or the next split point otherwise.
+
+            int splitPoint = this.hashBits;
+            if (this.splitIndex == 0) {
+                splitPoint--;
+            }
+
+            return splitPoint;
+        }
+
+        int bucketsNum() {
             return (1 << (this.hashBits - 1)) + this.splitIndex;
         }
 
-        static Metadata empty() {
-            return new Metadata(1, 0, new int[32]);
+        int expectedNumberOfPages() {
+            final int splitPoint = activeSplitPoint();
+
+            int numPages = bucketsNum();
+            for (int i = 0; i <= splitPoint; i++) {
+                numPages += this.overflowPages[i];
+            }
+
+            return numPages;
+        }
+
+        static Metadata forInitial(int initialSize) {
+            int bucketsNum = (initialSize == 1)
+                    ? 1
+                    : (Integer.highestOneBit(initialSize - 1) << 1);
+
+            int hashBits = Integer.SIZE - Integer.numberOfLeadingZeros(bucketsNum);
+
+            return new Metadata(hashBits, 0, new int[ARRAY_LENGTH]);
         }
     }
 
@@ -543,5 +574,19 @@ public class DiskHahMap {
         Flag(int bitNumber) {
             this.bitNumber = bitNumber;
         }
+    }
+
+
+    /*public DiskHahMap(Path filesDirectory, String mapName) throws IOException {
+        this(
+                Utils.openRWChannel(filesDirectory.resolve(mapName + "_data")),
+                Utils.openRWChannel(filesDirectory.resolve(mapName + "_fsm"))
+        );
+    }*/
+
+    /* -------------------- Handy factory methods -------------------- */
+
+    public static DiskHahMap oneBucket(SeekableByteChannel dataChannel, SeekableByteChannel fsmChannel) throws IOException {
+        return new DiskHahMap(dataChannel, fsmChannel, 1);
     }
 }

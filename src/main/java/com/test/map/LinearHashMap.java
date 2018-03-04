@@ -23,8 +23,10 @@ public class LinearHashMap<K, V> implements SimpleMap<K, V> {
     }
 
     public LinearHashMap(int initialSize, double maxLoadFactor) {
-        // TODO: what if initialSize == 1 ?
-        int bucketsNum = Integer.highestOneBit(initialSize - 1) << 1;
+        int bucketsNum = (initialSize == 1)
+                ? 1
+                : (Integer.highestOneBit(initialSize - 1) << 1);
+
         int segmentsNum = bucketsNum >>> BUCKET_HASH_BITS;
 
         // TODO: min or max ? Hmmm

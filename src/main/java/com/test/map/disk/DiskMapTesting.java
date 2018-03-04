@@ -7,8 +7,22 @@ import java.nio.file.Paths;
 
 public class DiskMapTesting {
 
+    @SneakyThrows
     public static void main(String[] args) {
         mapTesting();
+    }
+
+    @SneakyThrows
+    private static void initTesting() {
+        InMemoryChannel data = new InMemoryChannel();
+        InMemoryChannel fsm = new InMemoryChannel();
+
+        DiskHahMap map = DiskHahMap.oneBucket(data, fsm);
+        DiskHahMap map2 = new DiskHahMap(data, fsm);
+
+        Dumper.dumpToStdout(data.getArrayCopy());
+        System.out.println();
+        Dumper.dumpToStdout(fsm.getArrayCopy());
     }
 
     @SneakyThrows
@@ -17,7 +31,7 @@ public class DiskMapTesting {
         InMemoryChannel data = new InMemoryChannel();
         InMemoryChannel fsm = new InMemoryChannel();
 
-        DiskHahMap map = new DiskHahMap(data, fsm);
+        DiskHahMap map = new DiskHahMap(data, fsm, 1);
 
         int num = 20;
 
