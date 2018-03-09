@@ -31,32 +31,56 @@ public class DiskMapTesting {
         InMemoryChannel data = new InMemoryChannel();
         InMemoryChannel fsm = new InMemoryChannel();
 
-        DiskHahMap map = new DiskHahMap(data, fsm, 1);
+        DiskHahMap map = new DiskHahMap(data, fsm, 4);
 
-        int num = 20;
+        int num = 200;
 
         for (int i = 0; i < num; i++) {
-            map.put("key - " + i, "value - " + i);
+            map.put(key(i), "value - " + i);
         }
 
-        System.out.println("FSM dump");
+        System.out.println("After initial filling");
+        System.out.println("FSM");
         Dumper.dumpToStdout(fsm.getArrayCopy());
         System.out.println();
 
-        System.out.println("Data dump");
+        System.out.println("Data");
         Dumper.dumpToStdout(data.getArrayCopy());
         System.out.println();
 
-        for (int i = 0; i < num - 1; i++) {
-            System.out.println(map.get("key - " + i));
+        for (int i = 0; i < num; i++) {
+            System.out.println(map.get(key(i)));
         }
 
-        System.out.println(map.get("key - " + (num - 1)));
+        for (int i = 5; i < num - 5; i++) {
+            map.remove(key(i));
+        }
 
-        map.put("key - 0", "value - ZZZZZZZ123"); // to force displacement of this item to the last page
-        System.out.println(map.get("key - 0"));
+        System.out.println("After removing");
+        for (int i = 0; i < num; i++) {
+            System.out.println(map.get(key(i)));
+        }
 
+        Dumper.dumpToStdout(fsm.getArrayCopy());
+        System.out.println();
         Dumper.dumpToStdout(data.getArrayCopy());
+
+        for (int i = num / 4; i <= (3 * num) / 4; i++) {
+            map.put(key(i), "Restored:" + i);
+        }
+
+        System.out.println("After restoring some entries");
+        for (int i = 0; i < num; i++) {
+            System.out.println(map.get(key(i)));
+        }
+
+        Dumper.dumpToStdout(fsm.getArrayCopy());
+        System.out.println();
+        Dumper.dumpToStdout(data.getArrayCopy());
+    }
+
+    private static String key(int n) {
+        return "key#" + n;
     }
 
     @SneakyThrows

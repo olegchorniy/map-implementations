@@ -154,6 +154,7 @@ public class LinearHashMap<K, V> implements SimpleMap<K, V> {
         }
 
         final int splitSegmentIndex = segmentIndex(this.splitIndex);
+        // TODO: bucketIndex(...) call seems to be redundant here and below
         final int splitBucketIndex = bucketIndex(this.splitIndex);
 
         final Node<K, V>[] segment = this.segments[splitSegmentIndex];

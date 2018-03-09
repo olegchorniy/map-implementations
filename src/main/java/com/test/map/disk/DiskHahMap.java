@@ -90,7 +90,7 @@ public class DiskHahMap {
     /* -------------------- Testing API Methods -------------------- */
 
     public String get(String key) throws IOException {
-        byte[] value = get(key.getBytes());
+        byte[] value = get(bytes(key));
         if (value == null) {
             return null;
         }
@@ -99,7 +99,15 @@ public class DiskHahMap {
     }
 
     public void put(String key, String value) throws IOException {
-        put(key.getBytes(), value.getBytes());
+        put(bytes(key), bytes(value));
+    }
+
+    public void remove(String key) throws IOException {
+        remove(bytes(key));
+    }
+
+    private static byte[] bytes(String string) {
+        return string == null ? null : string.getBytes();
     }
 
     /* -------------------- Main API Methods -------------------- */
@@ -243,9 +251,100 @@ public class DiskHahMap {
 
         writeMetadata();
 
+        // TODO: could we combine this call with the findFreePage call above into a single takeFreePage call?
         this.fsm.take(newFsmPageNum);
 
         //split();
+    }
+
+    private void split() throws IOException {
+        /*
+        TODO: enable this check
+        if (this.loadFactor() < this.maxLoadFactor) {
+            return;
+        }
+        */
+
+        final Metadata metadata = this.metadata;
+        final int hashBits = metadata.hashBits;
+        final int splitIndex = metadata.splitIndex;
+        final int splitPageNum = bucketPageNumber(splitIndex);
+
+        final int edgeBit = 1 << (hashBits - 1);
+        final int buddyIndex = splitIndex + edgeBit; // splitIndex + 2 ^ (hashBits - 1)
+        final int buddyBucketPageNum = bucketPageNumber(buddyIndex);
+
+        Page prevBuddyPage = null;
+        int prevBuddyPageNum = 0;
+
+        Page buddyPage = Page.empty();
+        int buddyPageNum = buddyBucketPageNum;
+
+        //TODO; Notes:
+        //TODO;     1) Empty bucket page should be written to the disk anyway. Overflow page shouldn't.
+
+        int pageNum = splitPageNum;
+        do {
+            Page splitPage = readPage(pageNum);
+
+            for (int i = 0; i < splitPage.items.length; i++) {
+                Item item = splitPage.items[i];
+
+                if ((item.hash & edgeBit) != 0) {
+                    // Transfer item into another bucket
+
+                    // 1. Remove the item from the split bucket
+                    splitPage.removeItem(i);
+
+                    // 2. Add item to the buddy bucket
+                    if (buddyPage.freeSpace < item.size()) {
+                        int nextBuddyPageNum = this.fsm.findFreePage();
+
+                        prevBuddyPage = buddyPage;
+                        prevBuddyPageNum = buddyPageNum;
+
+                        buddyPage = Page.empty();
+                        buddyPageNum = nextBuddyPageNum;
+                    }
+
+                    buddyPage.addItem(item);
+
+                    // N. Adjust the loop index
+                    i--;
+                }
+            }
+
+
+            if (splitPage.isEmpty()) {
+                // TODO: free page if it is an overflow page
+            }
+
+            pageNum = splitPage.nextPageNumber;
+        } while (pageNum != Page.NO_PAGE);
+
+
+        if (buddyPage.isEmpty()) {
+
+        } else {
+            metadata.incOverflowPages();
+
+            int buddyDiskPageNum = fsmPageNumToOverflowPageNum(buddyPageNum);
+
+            // Write the prev. buddy page to the disk linking it to the last created page if the latter isn't empty.
+            if (prevBuddyPage != null) {
+                // link the last allocated page with the previous one
+                prevBuddyPage.nextPageNumber = buddyDiskPageNum;
+                writePage(prevBuddyPageNum, prevBuddyPage);
+            }
+
+            this.fsm.take(buddyPageNum);
+            writePage(buddyDiskPageNum, buddyPage);
+        }
+
+        // TODO: update split index and finally write updated metadata to disk
+        //writeMetadata();
+
+//        incSplitIndex();
     }
 
     public void remove(byte[] key) throws IOException {
@@ -273,7 +372,7 @@ public class DiskHahMap {
                     page.removeItem(i);
 
                     // Page isn't empty or it's a bucket page: just write it back to the channel.
-                    if (page.items.length != 0 || prevPage == null) {
+                    if (!page.isEmpty() || prevPage == null) {
                         writePage(pageNum, page);
                         return;
                     }
@@ -357,7 +456,6 @@ public class DiskHahMap {
         throw new IllegalStateException("There is no overflow page with fsm number: " + fsmPageNum);
     }
 
-    // TODO: double-check this code!!!
     private int overflowPageNumToFsmPageNum(int overflowPageNum) {
         final int splitPoint = this.metadata.activeSplitPoint();
         final int[] overflowPages = this.metadata.overflowPages;
@@ -562,6 +660,10 @@ public class DiskHahMap {
             this.items[index] = newItem;
         }
 
+        boolean isEmpty() {
+            return this.items.length == 0;
+        }
+
         static Page empty() {
             // max free space amount is equal to the max size of a single item
             return new Page(Item.MAX_SIZE, NO_PAGE, NO_ITEMS);
@@ -616,7 +718,7 @@ public class DiskHahMap {
         }
     }
 
-    private static class Flags {
+    /*private static class Flags {
 
         private final int value;
 
@@ -653,7 +755,7 @@ public class DiskHahMap {
     }
 
 
-    /*public DiskHahMap(Path filesDirectory, String mapName) throws IOException {
+    public DiskHahMap(Path filesDirectory, String mapName) throws IOException {
         this(
                 Utils.openRWChannel(filesDirectory.resolve(mapName + "_data")),
                 Utils.openRWChannel(filesDirectory.resolve(mapName + "_fsm"))

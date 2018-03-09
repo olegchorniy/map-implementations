@@ -115,6 +115,7 @@ public class FreeSpaceMap {
         return freePageNum;
     }
 
+    // TODO: use this implementation instead of the above one
     private int _takeFreePage() throws IOException {
         final int fsmPages = fsmPages();
 
