@@ -274,6 +274,9 @@ public class DiskHahMap {
         final int buddyIndex = splitIndex + edgeBit; // splitIndex + 2 ^ (hashBits - 1)
         final int buddyBucketPageNum = bucketPageNumber(buddyIndex);
 
+        Page prevPage = null;
+        int prevPageNum = 0;
+
         Page prevBuddyPage = null;
         int prevBuddyPageNum = 0;
 
@@ -298,18 +301,27 @@ public class DiskHahMap {
 
                     // 2. Add item to the buddy bucket
                     if (buddyPage.freeSpace < item.size()) {
-                        int nextBuddyPageNum = this.fsm.findFreePage();
+                        // Finally we can link pages together and save prev page to the disk.
+                        if (prevBuddyPage != null) {
+//                            int buddyPageNum = fsmPageNumToOverflowPageNum(buddyPageNum);
+//                            int prevBuddyPageNum = fsmPageNumToOverflowPageNum(prevBuddyPageNum);
+
+                            prevBuddyPage.nextPageNumber = buddyPageNum;
+
+                            this.fsm.take(buddyPageNum);
+                            writePage(prevBuddyPageNum, prevBuddyPage);
+                        }
 
                         prevBuddyPage = buddyPage;
                         prevBuddyPageNum = buddyPageNum;
 
                         buddyPage = Page.empty();
-                        buddyPageNum = nextBuddyPageNum;
+                        buddyPageNum = this.fsm.findFreePage();
                     }
 
                     buddyPage.addItem(item);
 
-                    // N. Adjust the loop index
+                    // 4. Adjust the loop index
                     i--;
                 }
             }
@@ -318,6 +330,9 @@ public class DiskHahMap {
             if (splitPage.isEmpty()) {
                 // TODO: free page if it is an overflow page
             }
+
+            prevPage = splitPage;
+            prevPageNum = pageNum;
 
             pageNum = splitPage.nextPageNumber;
         } while (pageNum != Page.NO_PAGE);
