@@ -16,6 +16,7 @@ import static com.test.map.disk.Utils.assertState;
  * <li>Sort items within each page by their keys</li>
  * <li>Compaction during page split</li>
  * <li>Replace bucket page with the first overflow page if it becomes free upon item deletion</li>
+ * <li>Hold calculated number of allocated overflow pages.</li>
  * </ul>
  * <p>
  * Things to think about:
@@ -32,6 +33,7 @@ public class DiskHahMap {
     private final FreeSpaceMap fsm;
 
     private Metadata metadata;
+    private boolean isMetadataDirty = false;
 
     public DiskHahMap(SeekableByteChannel dataChannel, SeekableByteChannel fsmChannel, int initialSize) throws IOException {
         this.dataChannel = dataChannel;
@@ -77,6 +79,13 @@ public class DiskHahMap {
     }
 
     /* -------------------- Metadata management methods -------------------- */
+
+    private void syncMetadataIfDirty() throws IOException {
+        if (this.isMetadataDirty) {
+            writeMetadata();
+            this.isMetadataDirty = false;
+        }
+    }
 
     private void readMetadata() throws IOException {
         byte[] metadataBytes = Utils.read(this.dataChannel, 0, Metadata.SIZE);
@@ -231,11 +240,7 @@ public class DiskHahMap {
             return;
         }
 
-        // Update map's metadata increasing overflow pages counter
-        // Important: this line should be executed before fsmPageNumToOverflowPageNum invocation.
-        metadata.incOverflowPages();
-
-        int newFsmPageNum = this.fsm.findFreePage();
+        int newFsmPageNum = getOverflowPage();
         int newPageNum = fsmPageNumToOverflowPageNum(newFsmPageNum);
 
         // Create a new page and add a new item into it
@@ -249,12 +254,24 @@ public class DiskHahMap {
         writePage(prevPageNum, prevPage);
         writePage(newPageNum, newPage);
 
-        writeMetadata();
+        syncMetadataIfDirty();
 
         // TODO: could we combine this call with the findFreePage call above into a single takeFreePage call?
         this.fsm.take(newFsmPageNum);
 
         //split();
+    }
+
+    private int getOverflowPage() throws IOException {
+        int newFsmPageNum = this.fsm.findFreePage();
+        if (newFsmPageNum == this.metadata.overflowPagesNum()) {
+            // Update map's metadata increasing overflow pages counter
+            this.metadata.incOverflowPages();
+            // Mark metadata as dirty
+            this.isMetadataDirty = true;
+        }
+
+        return newFsmPageNum;
     }
 
     private void split() throws IOException {
@@ -301,22 +318,7 @@ public class DiskHahMap {
 
                     // 2. Add item to the buddy bucket
                     if (buddyPage.freeSpace < item.size()) {
-                        // Finally we can link pages together and save prev page to the disk.
-                        if (prevBuddyPage != null) {
-//                            int buddyPageNum = fsmPageNumToOverflowPageNum(buddyPageNum);
-//                            int prevBuddyPageNum = fsmPageNumToOverflowPageNum(prevBuddyPageNum);
 
-                            prevBuddyPage.nextPageNumber = buddyPageNum;
-
-                            this.fsm.take(buddyPageNum);
-                            writePage(prevBuddyPageNum, prevBuddyPage);
-                        }
-
-                        prevBuddyPage = buddyPage;
-                        prevBuddyPageNum = buddyPageNum;
-
-                        buddyPage = Page.empty();
-                        buddyPageNum = this.fsm.findFreePage();
                     }
 
                     buddyPage.addItem(item);
@@ -459,8 +461,9 @@ public class DiskHahMap {
     private int fsmPageNumToOverflowPageNum(int fsmPageNum) {
         final int splitPoint = this.metadata.activeSplitPoint();
         final int[] overflowPages = this.metadata.overflowPages;
+        int pagesCount = 0;
 
-        for (int i = 0, pagesCount = 0; i <= splitPoint; i++) {
+        for (int i = 0; i <= splitPoint; i++) {
             pagesCount += overflowPages[i];
 
             if (fsmPageNum < pagesCount) {
@@ -468,7 +471,12 @@ public class DiskHahMap {
             }
         }
 
-        throw new IllegalStateException("There is no overflow page with fsm number: " + fsmPageNum);
+        // this may be necessary later
+        /*if (fsmPageNum == pagesCount) {
+            return fsmPageNum + (1 << splitPoint);
+        }*/
+
+        throw new IllegalStateException("Fsm page number is too big: " + fsmPageNum);
     }
 
     private int overflowPageNumToFsmPageNum(int overflowPageNum) {
@@ -602,6 +610,10 @@ public class DiskHahMap {
             }
 
             return numPages;
+        }
+
+        int overflowPagesNum() {
+            return Arrays.stream(this.overflowPages, 0, activeSplitPoint() + 1).sum();
         }
 
         static Metadata forInitial(int initialSize) {
